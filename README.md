@@ -26,7 +26,7 @@ This project is configured using environment variables, which are loaded from a 
 Example `.env` contents:
 
     ROBLOX_API_KEY = your_open_cloud_api_key_here
-    ROBLOX_UNIVERSE_ID = 9640149412
+    UNIVERSE_ID = 9640149412
     DATASTORE_ID = PlayerData_v1
 
 `PORT` is optional and defaults to 3000 if not provided.
