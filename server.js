@@ -6,8 +6,8 @@ const app = express();
 
 // ================== CONFIG ==================
 const ROBLOX_API_KEY = process.env.ROBLOX_API_KEY;
-const UNIVERSE_ID = "9640149412";
-const DATASTORE_ID = "PlayerData_v1"; // must match ProfileStore.New(...)
+const UNIVERSE_ID = process.env.UNIVERSE_ID;
+const DATASTORE_ID = process.env.DATASTORE_ID;
 const SCOPE = "global";
 // ============================================
 
