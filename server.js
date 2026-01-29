@@ -1,9 +1,11 @@
+require("dotenv").config();
+
 const express = require("express");
 
 const app = express();
 
 // ================== CONFIG ==================
-const ROBLOX_API_KEY = "";
+const ROBLOX_API_KEY = process.env.ROBLOX_API_KEY;
 const UNIVERSE_ID = "9640149412";
 const DATASTORE_ID = "PlayerData_v1"; // must match ProfileStore.New(...)
 const SCOPE = "global";
