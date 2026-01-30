@@ -1,7 +1,7 @@
 /**
  * Roblox Player Data Manager (Open Cloud Data Stores v2)
  * - Sidebar lookup + history
- * - Tabs filter JSON output
+ * - Tabs auto-generated from JSON structure
  * - Power Mode follows current tab (worldwide filter)
  * - Save/Reset only (no extra edit fields)
  * - Safe updates with ETag (If-Match)
@@ -223,10 +223,33 @@ app.get("/", (req, res) => {
       background: #0a1430;
       cursor: pointer;
       user-select: none;
+      font-size: 12px;
     }
     .tab.active {
       border-color: var(--accent);
       box-shadow: 0 0 0 1px rgba(125,211,252,.12);
+    }
+    .tab.readonly {
+      opacity: 0.7;
+      font-style: italic;
+    }
+    .tab-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .tab-group:last-child {
+      border-bottom: none;
+    }
+    .tab-group-label {
+      width: 100%;
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
     }
 
     .grid2 {
@@ -329,13 +352,13 @@ app.get("/", (req, res) => {
 
       <div id="cards" class="cards"></div>
 
-      <div class="tabs" id="tabs" style="display:none;"></div>
+      <div id="tabs" style="display:none;"></div>
 
       <div class="grid2">
         <div class="card">
           <div class="label">Section View</div>
           <div id="sectionView" class="value" style="font-size:13px; margin-top:10px;">
-            <div class="tiny">Pick a tab (Attributes/Combat/etc.) to render as a table.</div>
+            <div class="tiny">Pick a tab to render as a table or JSON.</div>
           </div>
         </div>
 
@@ -374,6 +397,7 @@ let lastEtag = null;
 let lastEntryId = null;
 
 // tab state
+let allTabs = [];
 let currentTabIndex = 0;
 let currentTab = null;
 
@@ -440,9 +464,6 @@ function renderCards(json) {
   const d = v?.Data;
   const md = v?.MetaData;
 
-  const invCount = Array.isArray(d?.Inventory) ? d.Inventory.length : "—";
-  const mutCount = Array.isArray(d?.Mutations) ? d.Mutations.length : "—";
-
   const cards = [
     ["Username", json.username],
     ["UserId", json.userId],
@@ -472,20 +493,16 @@ function renderTable(title, obj) {
     <table>
       <thead><tr><th>Key</th><th>Value</th></tr></thead>
       <tbody>
-        \${rows.map(([k,v]) => \`<tr><td>\${k}</td><td>\${v}</td></tr>\`).join("")}
+        \${rows.map(([k,v]) => {
+          // Handle nested objects/arrays by showing JSON
+          const display = (typeof v === "object" && v !== null) 
+            ? '<code>' + JSON.stringify(v) + '</code>' 
+            : v;
+          return \`<tr><td>\${k}</td><td>\${display}</td></tr>\`;
+        }).join("")}
       </tbody>
     </table>
   \`;
-}
-
-// Get payload by a path inside the *entry* object (not lastJson wrapper)
-function getByPath(root, pathArr) {
-  let cur = root;
-  for (const k of pathArr) {
-    if (!cur || typeof cur !== "object" || !(k in cur)) return undefined;
-    cur = cur[k];
-  }
-  return cur;
 }
 
 function setPowerModeEditable(editable, hint) {
@@ -500,18 +517,10 @@ function setPowerModeJson(obj) {
 }
 
 function activateTab(i) {
-  if (!lastJson) return;
+  if (!lastJson || !allTabs.length) return;
 
   currentTabIndex = i;
-
-  const entry = lastJson.data;
-  const value = entry?.value;
-  const data = value?.Data;
-  const stats = data?.Stats || {};
-
-  const tabs = buildTabs(value, data, stats);
-
-  currentTab = tabs[i];
+  currentTab = allTabs[i];
 
   // UI active state
   const root = $("tabs");
@@ -538,26 +547,78 @@ function activateTab(i) {
     setPowerModeEditable(false, "Read-only for this tab.");
   }
 
-  setMainStatus("Viewing: " + currentTab.name, "good");
+  setMainStatus("Viewing: " + currentTab.name + (currentTab.editPath ? "" : " (read-only)"), "good");
 }
 
-function buildTabs(value, data, stats) {
-  // editPath is relative to entry.value (NOT lastJson)
-  // Only allow edits inside Data subtree (safe). Full/MetaData/GlobalUpdates read-only.
-  return [
-    { name: "Full", kind: "json", payload: lastJson, editPath: null },
-    { name: "Data", kind: "json", payload: data, editPath: ["Data"] },
+// ---------- Dynamic Tab Builder ----------
+function isTabableObject(val) {
+  // An object is "tabable" if it's a plain object (not array)
+  if (val === null || typeof val !== "object" || Array.isArray(val)) return false;
+  return true;
+}
 
-    { name: "Attributes", kind: "table", payload: stats.Attributes, title: "Stats.Attributes", editPath: ["Data","Stats","Attributes"] },
-    { name: "Combat", kind: "table", payload: stats.Combat, title: "Stats.Combat", editPath: ["Data","Stats","Combat"] },
-    { name: "Skills", kind: "table", payload: stats.Skills, title: "Stats.Skills", editPath: ["Data","Stats","Skills"] },
-    { name: "Resistances", kind: "table", payload: stats.Resistances, title: "Stats.Resistances", editPath: ["Data","Stats","Resistances"] },
-    { name: "Reputation", kind: "table", payload: stats.Reputation, title: "Stats.Reputation", editPath: ["Data","Stats","Reputation"] },
+function isPrimitiveObject(val) {
+  // Returns true if object only contains primitive values (good for table display)
+  if (!isTabableObject(val)) return false;
+  return Object.values(val).every(v => 
+    v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean"
+  );
+}
 
-    // Keep these tabs because they are useful to view, but keep read-only by default
-    { name: "MetaData", kind: "json", payload: value?.MetaData, editPath: null },
-    { name: "GlobalUpdates", kind: "json", payload: value?.GlobalUpdates, editPath: null },
-  ];
+function buildTabs(value, data) {
+  const tabs = [];
+  
+  // Group 1: Core views
+  tabs.push(
+    { name: "Full", kind: "json", payload: lastJson, editPath: null, group: "core" },
+    { name: "Data", kind: "json", payload: data, editPath: ["Data"], group: "core" }
+  );
+
+  // Group 2: Stats sub-objects (auto-detected)
+  const stats = data?.Stats;
+  if (stats && typeof stats === "object") {
+    const statsKeys = Object.keys(stats).sort();
+    for (const key of statsKeys) {
+      const val = stats[key];
+      if (isTabableObject(val)) {
+        tabs.push({
+          name: key,
+          kind: isPrimitiveObject(val) ? "table" : "json",
+          payload: val,
+          title: "Stats." + key,
+          editPath: ["Data", "Stats", key],
+          group: "stats"
+        });
+      }
+    }
+  }
+
+  // Group 3: Other Data sub-objects (Equipment, Eggs, Inventory, etc.)
+  if (data && typeof data === "object") {
+    const dataKeys = Object.keys(data).sort();
+    for (const key of dataKeys) {
+      if (key === "Stats") continue; // Already handled
+      const val = data[key];
+      if (isTabableObject(val)) {
+        tabs.push({
+          name: key,
+          kind: isPrimitiveObject(val) ? "table" : "json",
+          payload: val,
+          title: "Data." + key,
+          editPath: ["Data", key],
+          group: "data"
+        });
+      }
+    }
+  }
+
+  // Group 4: Metadata (read-only)
+  tabs.push(
+    { name: "MetaData", kind: "json", payload: value?.MetaData, editPath: null, group: "meta" },
+    { name: "GlobalUpdates", kind: "json", payload: value?.GlobalUpdates, editPath: null, group: "meta" }
+  );
+
+  return tabs;
 }
 
 function renderTabs() {
@@ -566,13 +627,40 @@ function renderTabs() {
   const entry = lastJson.data;
   const value = entry?.value;
   const data = value?.Data;
-  const stats = data?.Stats || {};
 
-  const tabs = buildTabs(value, data, stats);
+  allTabs = buildTabs(value, data);
 
   const root = $("tabs");
-  root.style.display = "flex";
-  root.innerHTML = tabs.map((t, i) => \`<div class="tab" data-i="\${i}">\${t.name}</div>\`).join("");
+  root.style.display = "block";
+  
+  // Group tabs by category
+  const groups = {
+    core: { label: "Core", tabs: [] },
+    stats: { label: "Stats", tabs: [] },
+    data: { label: "Data Objects", tabs: [] },
+    meta: { label: "Metadata (Read-only)", tabs: [] }
+  };
+
+  allTabs.forEach((t, i) => {
+    const group = t.group || "data";
+    if (groups[group]) {
+      groups[group].tabs.push({ ...t, index: i });
+    }
+  });
+
+  let html = '';
+  for (const [groupKey, group] of Object.entries(groups)) {
+    if (group.tabs.length === 0) continue;
+    html += '<div class="tab-group">';
+    html += '<div class="tab-group-label">' + group.label + '</div>';
+    for (const t of group.tabs) {
+      const readonlyClass = t.editPath ? '' : ' readonly';
+      html += '<div class="tab' + readonlyClass + '" data-i="' + t.index + '">' + t.name + '</div>';
+    }
+    html += '</div>';
+  }
+  
+  root.innerHTML = html;
 
   root.onclick = (e) => {
     const el = e.target.closest(".tab");
@@ -580,7 +668,7 @@ function renderTabs() {
     activateTab(Number(el.dataset.i));
   };
 
-  // default to Data
+  // Default to Data tab
   activateTab(1);
 }
 
@@ -657,7 +745,6 @@ async function saveEdits() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         expectedEtag: lastEtag,
-        // editPath relative to entry.value
         editPath: currentTab.editPath,
         value: newObj
       }),
