@@ -1,9 +1,10 @@
 /**
  * Roblox Player Data Manager (Open Cloud Data Stores v2)
- * - Sidebar lookup + history
- * - Tabs auto-generated from JSON structure
- * - Power Mode follows current tab (worldwide filter)
- * - Save/Reset only (no extra edit fields)
+ * - Game tabs with datastore sub-tabs
+ * - Per-game API keys and universe IDs
+ * - Raw JSON display + editor
+ * - Configurable entry key templates
+ * - Purge player data across all datastores for a game
  * - Safe updates with ETag (If-Match)
  *
  * Node 18+ recommended (built-in fetch).
@@ -17,22 +18,89 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 // ================== CONFIG ==================
-const ROBLOX_API_KEY = process.env.ROBLOX_API_KEY;
-const UNIVERSE_ID = process.env.UNIVERSE_ID;
-const DATASTORE_ID = process.env.DATASTORE_ID;
-const SCOPE = process.env.SCOPE || "global";
 const PORT = Number(process.env.PORT || 3000);
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
-// Optional: protect write endpoints
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ""; // if set, UI must provide it for writes
-// ============================================
+// Parse GAME_* entries: GAME_1="Name|Universe ID|API Key|Max Slots"
+function parseGames() {
+  const games = new Map();
+  for (const [key, val] of Object.entries(process.env)) {
+    if (/^GAME_\d+$/.test(key) && val) {
+      const parts = val.split("|").map((s) => s.trim());
+      if (parts.length >= 3) {
+        const num = key.split("_")[1];
+        games.set(num, {
+          num,
+          name: parts[0],
+          universeId: parts[1],
+          apiKey: parts[2],
+          maxSlots: parseInt(parts[3]) || 1,
+          stores: [],
+        });
+      }
+    }
+  }
+  return games;
+}
 
-if (!ROBLOX_API_KEY || ROBLOX_API_KEY.includes("PASTE")) {
-  console.error("❌ Set ROBLOX_API_KEY in .env");
+// Parse DATASTORE_* entries: DATASTORE_1="Game Number|Store Label|DataStore Name|Scope|Key Template"
+function parseDatastores(gamesMap) {
+  const stores = [];
+  for (const [key, val] of Object.entries(process.env)) {
+    if (/^DATASTORE_\d+$/.test(key) && val) {
+      const parts = val.split("|").map((s) => s.trim());
+      if (parts.length >= 3) {
+        const gameNum = parts[0];
+        const game = gamesMap.get(gameNum);
+        if (!game) {
+          console.warn(`${key} references GAME_${gameNum} which doesn't exist, skipping.`);
+          continue;
+        }
+
+        const keyTemplate = parts[4] || "Player_{userId}";
+        const extraParams = [];
+        const paramRegex = /\{(\w+)\}/g;
+        let m;
+        while ((m = paramRegex.exec(keyTemplate)) !== null) {
+          if (m[1] !== "userId") extraParams.push(m[1]);
+        }
+
+        const store = {
+          id: key,
+          gameNum,
+          storeLabel: parts[1],
+          datastoreId: parts[2],
+          scope: parts[3] || "global",
+          keyTemplate,
+          extraParams,
+        };
+
+        stores.push(store);
+        game.stores.push(store);
+      }
+    }
+  }
+  // Sort by numeric suffix
+  stores.sort((a, b) => {
+    const numA = parseInt(a.id.split("_")[1]);
+    const numB = parseInt(b.id.split("_")[1]);
+    return numA - numB;
+  });
+  return stores;
+}
+
+const GAMES_MAP = parseGames();
+const ALL_STORES = parseDatastores(GAMES_MAP);
+const GAMES = [...GAMES_MAP.values()].sort((a, b) => parseInt(a.num) - parseInt(b.num));
+
+if (GAMES.length === 0) {
+  console.error("No GAME_* entries found in .env. Add at least one.");
+  console.error('Format: GAME_1="Name|UniverseId|ApiKey"');
   process.exit(1);
 }
-if (!UNIVERSE_ID || !DATASTORE_ID) {
-  console.error("❌ Set UNIVERSE_ID and DATASTORE_ID in .env");
+if (ALL_STORES.length === 0) {
+  console.error("No DATASTORE_* entries found in .env. Add at least one.");
+  console.error('Format: DATASTORE_1="GameNumber|StoreLabel|DataStoreName|Scope|KeyTemplate"');
   process.exit(1);
 }
 
@@ -71,13 +139,86 @@ async function fetchJson(url, options = {}, { timeoutMs = 10000, retries = 2 } =
   }
 }
 
-function entryUrl(entryId) {
+function entryUrl(universeId, datastoreId, scope, entryId) {
   return (
-    `https://apis.roblox.com/cloud/v2/universes/${encodeURIComponent(UNIVERSE_ID)}` +
-    `/data-stores/${encodeURIComponent(DATASTORE_ID)}` +
-    `/scopes/${encodeURIComponent(SCOPE)}` +
+    `https://apis.roblox.com/cloud/v2/universes/${encodeURIComponent(universeId)}` +
+    `/data-stores/${encodeURIComponent(datastoreId)}` +
+    `/scopes/${encodeURIComponent(scope)}` +
     `/entries/${encodeURIComponent(entryId)}`
   );
+}
+
+function buildEntryKey(template, userId, extras = {}) {
+  let key = template.replace("{userId}", userId);
+  for (const [k, v] of Object.entries(extras)) {
+    key = key.replace(`{${k}}`, v);
+  }
+  const unresolved = key.match(/\{(\w+)\}/);
+  if (unresolved) {
+    throw new Error(`Missing parameter: ${unresolved[1]}`);
+  }
+  return key;
+}
+
+// For purge: expand all possible keys for a store template
+// e.g. "Account_{userId}_Slot_{slot}" with maxSlots=3 -> 3 keys
+function expandAllKeys(template, userId, maxSlots) {
+  const params = [];
+  const paramRegex = /\{(\w+)\}/g;
+  let m;
+  while ((m = paramRegex.exec(template)) !== null) {
+    if (m[1] !== "userId") params.push(m[1]);
+  }
+
+  if (params.length === 0) {
+    return [buildEntryKey(template, userId)];
+  }
+
+  const keys = [];
+  for (let i = 1; i <= maxSlots; i++) {
+    const extras = {};
+    for (const p of params) extras[p] = String(i);
+    keys.push(buildEntryKey(template, userId, extras));
+  }
+  return keys;
+}
+
+// DELETE helper — doesn't expect JSON body back, just checks status
+async function deleteEntry(url, apiKey, { timeoutMs = 10000, retries = 2 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const r = await fetch(url, {
+        method: "DELETE",
+        headers: { "x-api-key": apiKey },
+        signal: controller.signal,
+      });
+
+      if (r.ok || r.status === 204) {
+        return { ok: true, status: r.status };
+      }
+
+      // 404 means entry doesn't exist — not an error for purge
+      if (r.status === 404) {
+        return { ok: true, status: 404, skipped: true };
+      }
+
+      if ((r.status === 429 || r.status >= 500) && attempt < retries) {
+        const backoff = 250 * Math.pow(2, attempt);
+        await new Promise((s) => setTimeout(s, backoff));
+        continue;
+      }
+
+      const text = await r.text();
+      let details;
+      try { details = JSON.parse(text); } catch { details = { raw: text }; }
+      return { ok: false, status: r.status, error: `HTTP ${r.status}`, details };
+    } finally {
+      clearTimeout(t);
+    }
+  }
 }
 
 async function usernameToUserId(username) {
@@ -98,23 +239,186 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// Deep set helper: sets obj[path[0]][path[1]]... = value (creating objects along the way)
-function setAtPath(root, pathArr, value) {
-  let cur = root;
-  for (let i = 0; i < pathArr.length - 1; i++) {
-    const k = pathArr[i];
-    if (cur[k] == null || typeof cur[k] !== "object") cur[k] = {};
-    cur = cur[k];
-  }
-  cur[pathArr[pathArr.length - 1]] = value;
+function getStoreConfig(dsId) {
+  return ALL_STORES.find((d) => d.id === dsId) || null;
 }
 
-function isPlainObject(x) {
-  return x !== null && typeof x === "object" && !Array.isArray(x);
+function getGameForStore(store) {
+  return GAMES_MAP.get(store.gameNum) || null;
 }
 
 // ---------- Health ----------
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// ---------- API: List config (no API keys exposed) ----------
+app.get("/api/config", (req, res) => {
+  res.json({
+    games: GAMES.map((g) => ({
+      num: g.num,
+      name: g.name,
+      universeId: g.universeId,
+      maxSlots: g.maxSlots,
+      stores: g.stores.map((s) => ({
+        id: s.id,
+        storeLabel: s.storeLabel,
+        datastoreId: s.datastoreId,
+        scope: s.scope,
+        keyTemplate: s.keyTemplate,
+        extraParams: s.extraParams,
+      })),
+    })),
+  });
+});
+
+// ---------- API: Read Player ----------
+app.get("/api/player/:username", async (req, res) => {
+  try {
+    const username = req.params.username;
+    const dsId = req.query.ds;
+
+    const store = getStoreConfig(dsId);
+    if (!store) return res.status(400).json({ error: "Invalid datastore selection" });
+
+    const game = getGameForStore(store);
+    if (!game) return res.status(400).json({ error: "Game not found for store" });
+
+    const userId = await usernameToUserId(username);
+    if (!userId) return res.status(404).json({ error: "Username not found" });
+
+    const extras = {};
+    for (const p of store.extraParams) {
+      if (req.query[p]) extras[p] = req.query[p];
+    }
+
+    const entryId = buildEntryKey(store.keyTemplate, userId, extras);
+    const data = await fetchJson(
+      entryUrl(game.universeId, store.datastoreId, store.scope, entryId),
+      { headers: { "x-api-key": game.apiKey } }
+    );
+
+    res.json({
+      username,
+      userId,
+      entryId,
+      data,
+      game: game.name,
+      store: store.storeLabel,
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message, details: err.details || null });
+  }
+});
+
+// ---------- API: Update full value (ETag protected) ----------
+app.post("/api/player/:username/update", requireAdmin, async (req, res) => {
+  try {
+    const username = req.params.username;
+    const dsId = req.query.ds;
+    const { expectedEtag, value } = req.body || {};
+
+    const store = getStoreConfig(dsId);
+    if (!store) return res.status(400).json({ error: "Invalid datastore selection" });
+
+    const game = getGameForStore(store);
+    if (!game) return res.status(400).json({ error: "Game not found for store" });
+
+    if (value === undefined) {
+      return res.status(400).json({ error: "Body must include { value: ... }" });
+    }
+
+    const userId = await usernameToUserId(username);
+    if (!userId) return res.status(404).json({ error: "Username not found" });
+
+    const extras = {};
+    for (const p of store.extraParams) {
+      if (req.query[p]) extras[p] = req.query[p];
+    }
+
+    const entryId = buildEntryKey(store.keyTemplate, userId, extras);
+    const url = entryUrl(game.universeId, store.datastoreId, store.scope, entryId);
+
+    const current = await fetchJson(url, {
+      headers: { "x-api-key": game.apiKey },
+    });
+
+    const currentEtag = current.etag;
+    if (expectedEtag && currentEtag && expectedEtag !== currentEtag) {
+      return res.status(409).json({
+        error: "ETag mismatch (data was modified externally). Reload and try again.",
+        expectedEtag,
+        currentEtag,
+      });
+    }
+
+    const body = JSON.stringify({ value });
+
+    const updated = await fetchJson(url, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body).toString(),
+        "x-api-key": game.apiKey,
+        ...(currentEtag ? { "If-Match": currentEtag } : {}),
+      },
+      body,
+    });
+
+    res.json({ ok: true, entryId, updated });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message, details: err.details || null });
+  }
+});
+
+// ---------- API: Purge all data for a player across all datastores in a game ----------
+app.post("/api/purge/:username", requireAdmin, async (req, res) => {
+  try {
+    const username = req.params.username;
+    const gameNum = req.query.game;
+
+    const game = GAMES_MAP.get(gameNum);
+    if (!game) return res.status(400).json({ error: "Invalid game selection" });
+
+    if (!game.stores.length) {
+      return res.status(400).json({ error: "No datastores configured for this game" });
+    }
+
+    const userId = await usernameToUserId(username);
+    if (!userId) return res.status(404).json({ error: "Username not found" });
+
+    const results = [];
+
+    for (const store of game.stores) {
+      const keys = expandAllKeys(store.keyTemplate, userId, game.maxSlots);
+
+      for (const entryId of keys) {
+        const url = entryUrl(game.universeId, store.datastoreId, store.scope, entryId);
+        const result = await deleteEntry(url, game.apiKey);
+
+        results.push({
+          store: store.storeLabel,
+          datastoreId: store.datastoreId,
+          entryId,
+          ...result,
+        });
+      }
+    }
+
+    const deleted = results.filter((r) => r.ok && !r.skipped).length;
+    const skipped = results.filter((r) => r.ok && r.skipped).length;
+    const failed = results.filter((r) => !r.ok).length;
+
+    res.json({
+      ok: failed === 0,
+      username,
+      userId,
+      game: game.name,
+      summary: { deleted, skipped, failed, total: results.length },
+      results,
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message, details: err.details || null });
+  }
+});
 
 // ---------- UI ----------
 app.get("/", (req, res) => {
@@ -126,6 +430,9 @@ app.get("/", (req, res) => {
   <title>Roblox Player Data Manager</title>
   <style>
     :root {
+      --bg: #070b14;
+      --bg2: #0b1220;
+      --surface: #0f172a;
       --border: #1f2a44;
       --text: #e5e7eb;
       --muted: #94a3b8;
@@ -133,163 +440,195 @@ app.get("/", (req, res) => {
       --good: #86efac;
       --bad: #fecaca;
     }
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; margin: 0; }
     body {
-      margin: 0;
-      background: #070b14;
+      background: var(--bg);
       color: var(--text);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }
-    .app {
+
+    /* Top bar with game tabs */
+    .topbar {
+      background: #050812;
+      border-bottom: 1px solid var(--border);
+      padding: 0 20px;
+      display: flex;
+      align-items: stretch;
+    }
+    #gameTabs { display: flex; align-items: stretch; }
+    #storeTabs { display: flex; align-items: stretch; }
+    .topbar-title {
+      font-size: 14px;
+      padding: 12px 16px 12px 0;
+      border-right: 1px solid var(--border);
+      margin-right: 4px;
+      display: flex;
+      align-items: center;
+      white-space: nowrap;
+    }
+    .game-tab {
+      padding: 12px 18px;
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--muted);
+      border-bottom: 2px solid transparent;
+      transition: color 0.15s, border-color 0.15s;
+      user-select: none;
+    }
+    .game-tab:hover { color: var(--text); }
+    .game-tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    /* Sub-tabs (datastores) */
+    .subtabs {
+      background: #0a0e1a;
+      border-bottom: 1px solid var(--border);
+      padding: 0 20px;
+      display: flex;
+      align-items: stretch;
+    }
+    .store-tab {
+      padding: 10px 16px;
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--muted);
+      border-bottom: 2px solid transparent;
+      transition: color 0.15s, border-color 0.15s;
+      user-select: none;
+    }
+    .store-tab:hover { color: var(--text); }
+    .store-tab.active {
+      color: var(--good);
+      border-bottom-color: var(--good);
+    }
+    .store-tab .store-key {
+      font-size: 11px;
+      color: var(--muted);
+      opacity: 0.6;
+      margin-left: 6px;
+    }
+
+    /* Layout */
+    .layout {
       display: grid;
-      grid-template-columns: 320px 1fr;
-      min-height: 100vh;
+      grid-template-columns: 280px 1fr;
+      min-height: calc(100vh - 84px);
     }
+
+    /* Sidebar */
     .sidebar {
       background: #050812;
       border-right: 1px solid var(--border);
-      padding: 14px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
     }
-    .main {
-      background: #070b14;
-      padding: 18px;
-    }
-    h1 {
-      font-size: 16px;
-      margin: 0 0 10px;
-      color: var(--text);
-    }
-    h2 {
-      font-size: 14px;
-      margin: 18px 0 8px;
+    .sidebar h2 {
+      font-size: 12px;
       color: var(--muted);
-      font-weight: 600;
-      letter-spacing: .02em;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-top: 10px;
     }
-    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+
+    /* Form controls */
     input, button, textarea {
-      background: #0b1220;
+      background: var(--bg2);
       color: var(--text);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 10px 12px;
+      border-radius: 8px;
+      padding: 9px 11px;
       font-size: 13px;
+      font-family: inherit;
       outline: none;
+      width: 100%;
     }
-    textarea { width: 100%; min-height: 260px; resize: vertical; line-height: 1.35; }
-    input { width: 100%; }
-    button { cursor: pointer; }
+    button { cursor: pointer; width: auto; }
     button:hover { border-color: var(--accent); }
+    textarea {
+      resize: vertical;
+      line-height: 1.4;
+      min-height: 300px;
+      tab-size: 2;
+    }
+
+    .btn-row { display: flex; gap: 8px; margin-top: 6px; }
+    .btn-row button { flex: 1; }
     .btn-primary { border-color: #2b4a67; }
     .btn-danger { border-color: #7f1d1d; }
     .btn-danger:hover { border-color: #ef4444; }
 
+    /* Status */
     .status {
-      margin-top: 10px;
-      padding: 10px 12px;
-      border-radius: 12px;
+      padding: 9px 11px;
+      border-radius: 8px;
       border: 1px solid var(--border);
-      background: #071026;
+      background: var(--bg2);
       color: var(--muted);
+      font-size: 12px;
+      margin-top: 6px;
     }
     .status.good { border-color: #14532d; color: var(--good); background: #07150f; }
     .status.bad { border-color: #7f1d1d; color: var(--bad); background: #150708; }
 
-    .cards {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-      gap: 10px;
-      margin-top: 12px;
-    }
-    .card {
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 12px;
-    }
-    .label { color: var(--muted); font-size: 12px; }
-    .value { margin-top: 6px; font-size: 16px; word-break: break-word; }
-
-    .tabs {
-      display:flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 14px;
-    }
-    .tab {
-      padding: 8px 12px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: #0a1430;
-      cursor: pointer;
-      user-select: none;
-      font-size: 12px;
-    }
-    .tab.active {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 1px rgba(125,211,252,.12);
-    }
-    .tab.readonly {
-      opacity: 0.7;
-      font-style: italic;
-    }
-    .tab-group {
+    /* Main */
+    .main {
+      padding: 20px;
       display: flex;
+      flex-direction: column;
+      gap: 14px;
+      overflow: hidden;
+    }
+    .player-header {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
       flex-wrap: wrap;
-      gap: 8px;
-      padding: 8px 0;
-      border-bottom: 1px solid var(--border);
     }
-    .tab-group:last-child {
-      border-bottom: none;
-    }
-    .tab-group-label {
-      width: 100%;
-      font-size: 11px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      margin-bottom: 4px;
-    }
+    .player-header h1 { font-size: 16px; }
+    .player-header .meta { font-size: 12px; color: var(--muted); }
 
-    .grid2 {
+    /* Two-pane layout */
+    .panes {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-top: 14px;
+      gap: 14px;
+      flex: 1;
+      min-height: 0;
     }
-    @media (max-width: 1100px) {
-      .app { grid-template-columns: 1fr; }
-      .sidebar { border-right: none; border-bottom: 1px solid var(--border); }
-      .grid2 { grid-template-columns: 1fr; }
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 10px;
-      overflow: hidden;
-      border-radius: 14px;
+    .pane {
+      background: var(--surface);
       border: 1px solid var(--border);
-      background: #0f172a;
+      border-radius: 12px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
     }
-    th, td {
-      padding: 10px 12px;
-      border-bottom: 1px solid rgba(148,163,184,.12);
-      font-size: 13px;
+    .pane-label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-bottom: 10px;
+      flex-shrink: 0;
     }
-    th { text-align:left; color: var(--muted); background: #0a1430; }
-    tr:last-child td { border-bottom: none; }
 
-    pre {
+    /* JSON display */
+    pre.json {
       background: #030712;
       border: 1px solid var(--border);
-      border-radius: 16px;
+      border-radius: 8px;
       padding: 12px;
-      max-height: 60vh;
       overflow: auto;
       line-height: 1.35;
-      margin-top: 10px;
+      font-size: 13px;
+      flex: 1;
+      min-height: 0;
     }
     .key { color: #7dd3fc; }
     .string { color: #86efac; }
@@ -297,116 +636,174 @@ app.get("/", (req, res) => {
     .boolean { color: #fca5a5; }
     .null { color: #c4b5fd; }
 
-    .history {
-      display:flex;
+    /* Editor pane */
+    .editor-wrap {
+      flex: 1;
+      display: flex;
       flex-direction: column;
-      gap: 8px;
-      margin-top: 8px;
+      min-height: 0;
     }
+    .editor-wrap textarea { flex: 1; }
+
+    /* Extra param inputs */
+    #extraParams { display: flex; flex-direction: column; gap: 6px; }
+    #extraParams:empty { display: none; }
+
+    /* History */
+    .history { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
     .historyItem {
-      padding: 10px 12px;
-      border-radius: 12px;
+      padding: 8px 10px;
+      border-radius: 8px;
       border: 1px solid var(--border);
-      background: #071026;
+      background: var(--bg2);
       cursor: pointer;
-      display:flex;
-      align-items:center;
+      display: flex;
+      align-items: center;
       justify-content: space-between;
-      gap: 10px;
+      font-size: 13px;
     }
     .historyItem:hover { border-color: var(--accent); }
     .tiny { font-size: 12px; color: var(--muted); }
-    .split { display:flex; gap: 8px; align-items:center; justify-content: space-between; flex-wrap: wrap; }
+
+    /* Purge confirmation overlay */
+    .overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.75);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+    }
+    .overlay.show { display: flex; }
+    .overlay-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 24px;
+      max-width: 480px;
+      width: 90%;
+    }
+    .overlay-box h2 { font-size: 16px; color: var(--bad); margin-bottom: 12px; }
+    .overlay-box p { font-size: 13px; color: var(--muted); margin-bottom: 8px; line-height: 1.5; }
+    .overlay-box .warn { color: var(--bad); font-size: 12px; margin-bottom: 14px; }
+    .overlay-box .btn-row { margin-top: 16px; }
+    .purge-log {
+      background: #030712;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 12px;
+      max-height: 200px;
+      overflow: auto;
+      margin-top: 10px;
+      display: none;
+      line-height: 1.6;
+    }
+    .purge-log.show { display: block; }
+    .purge-log .del { color: var(--bad); }
+    .purge-log .skip { color: var(--muted); }
+    .purge-log .ok { color: var(--good); }
+    .purge-log .fail { color: #f87171; }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { border-right: none; border-bottom: 1px solid var(--border); }
+      .panes { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <div class="app">
-    <aside class="sidebar">
-      <h1>Roblox Player Data Manager</h1>
 
+  <div class="topbar">
+    <div class="topbar-title">Player Data Manager</div>
+    <div id="gameTabs"></div>
+  </div>
+
+  <div class="subtabs" id="storeTabs"></div>
+
+  <div class="layout">
+    <aside class="sidebar">
       <h2>Lookup</h2>
-      <div class="row">
-        <input id="username" placeholder="Username (e.g. HaoshokuRed)" />
-      </div>
-      <div class="row">
-        <button class="btn-primary" id="btnFetch" style="flex:1;">Fetch Player</button>
-        <button id="btnCopy" style="flex:1;">Copy JSON</button>
+      <input id="username" placeholder="Username" />
+      <div id="extraParams"></div>
+      <div class="btn-row">
+        <button class="btn-primary" id="btnFetch">Fetch</button>
+        <button id="btnCopy">Copy JSON</button>
       </div>
 
       <h2>Recent</h2>
       <div class="history" id="history"></div>
 
+      <h2>Danger Zone</h2>
+      <button class="btn-danger" id="btnPurge" style="width:100%;">Purge Player From Game</button>
+
+      <div style="flex:1;"></div>
       <div id="sideStatus" class="status">Ready.</div>
     </aside>
 
     <main class="main">
-      <div class="split">
-        <div>
-          <h1 id="title">No player loaded</h1>
-          <div class="tiny" id="subtitle">Fetch a player to begin.</div>
-        </div>
-        <div class="row">
-          <button id="btnReload">Reload</button>
-        </div>
+      <div class="player-header">
+        <h1 id="title">No player loaded</h1>
+        <span class="meta" id="subtitle"></span>
+        <div style="flex:1;"></div>
+        <button id="btnReload" style="width:auto;">Reload</button>
       </div>
 
-      <div id="cards" class="cards"></div>
-
-      <div id="tabs" style="display:none;"></div>
-
-      <div class="grid2">
-        <div class="card">
-          <div class="label">Section View</div>
-          <div id="sectionView" class="value" style="font-size:13px; margin-top:10px;">
-            <div class="tiny">Pick a tab to render as a table or JSON.</div>
-          </div>
+      <div class="panes">
+        <div class="pane">
+          <div class="pane-label">Raw Data (read-only)</div>
+          <pre class="json" id="output">Fetch a player to view their data.</pre>
         </div>
 
-        <div class="card">
-          <div class="label">Power mode</div>
-          <div class="tiny" style="margin-top:8px;">
-            This editor follows the selected tab. Save writes back to that exact section.
+        <div class="pane">
+          <div class="pane-label">Editor</div>
+          <div class="editor-wrap">
+            <textarea id="editor" spellcheck="false" placeholder="Fetch a player to start editing..."></textarea>
+            <div class="btn-row" style="margin-top:10px;">
+              <button class="btn-primary" id="btnSave">Save</button>
+              <button class="btn-danger" id="btnReset">Reset</button>
+            </div>
+            <div id="mainStatus" class="status">No data loaded.</div>
           </div>
-
-          <h2 style="margin-top:14px;">JSON editor (current tab)</h2>
-          <textarea id="powerJson" spellcheck="false"></textarea>
-
-          <div class="row" style="margin-top:10px;">
-            <button class="btn-primary" id="btnSave" style="flex:1;">Save</button>
-            <button class="btn-danger" id="btnReset" style="flex:1;">Reset</button>
-          </div>
-
-          <div id="mainStatus" class="status" style="margin-top:10px;">No edits pending.</div>
-          <div class="tiny" id="editHint" style="margin-top:8px;"></div>
         </div>
-      </div>
-
-      <div class="card" style="margin-top:14px;">
-        <div class="label">JSON Output (filtered by tab)</div>
-        <pre id="output">Waiting…</pre>
       </div>
     </main>
   </div>
 
+  <!-- Purge confirmation overlay -->
+  <div class="overlay" id="purgeOverlay">
+    <div class="overlay-box">
+      <h2>Purge Player Data</h2>
+      <p id="purgeDesc"></p>
+      <p class="warn">This will permanently DELETE all entries for this player across every datastore in this game. This cannot be undone.</p>
+      <div class="btn-row">
+        <button class="btn-danger" id="btnConfirmPurge" style="flex:1;">Confirm Purge</button>
+        <button id="btnCancelPurge" style="flex:1;">Cancel</button>
+      </div>
+      <div class="purge-log" id="purgeLog"></div>
+    </div>
+  </div>
+
 <script>
 const $ = (id) => document.getElementById(id);
+
+let config = { games: [] };
+let currentGameIdx = 0;
+let currentStoreIdx = 0;
+let currentStore = null;
 
 let lastUsername = "";
 let lastJson = null;
 let lastEtag = null;
 let lastEntryId = null;
 
-// tab state
-let allTabs = [];
-let currentTabIndex = 0;
-let currentTab = null;
-
-function setSideStatus(msg, kind="") {
+function setSideStatus(msg, kind = "") {
   const el = $("sideStatus");
   el.className = "status" + (kind ? " " + kind : "");
   el.textContent = msg;
 }
-function setMainStatus(msg, kind="") {
+function setMainStatus(msg, kind = "") {
   const el = $("mainStatus");
   el.className = "status" + (kind ? " " + kind : "");
   el.textContent = msg;
@@ -421,274 +818,184 @@ function syntaxHighlight(json) {
     (match, bool, _b, num, key, str) => {
       if (bool) return '<span class="boolean">' + bool + "</span>";
       if (num) return '<span class="number">' + num + "</span>";
-      if (key) return '<span class="key">"' + key + '"</span>:';
-      if (str) return '<span class="string">"' + str + '"</span>';
+      if (key) return '<span class="key">\\"' + key + '\\"</span>:';
+      if (str) return '<span class="string">\\"' + str + '\\"</span>';
       return match;
     }
   );
 }
 
-function unixToLocal(ts) {
-  if (!ts || typeof ts !== "number") return "—";
-  return new Date(ts * 1000).toLocaleString();
+// ---- Extra params ----
+function getExtraParams() {
+  if (!currentStore) return {};
+  const params = {};
+  for (const p of currentStore.extraParams) {
+    const input = document.querySelector('[data-param="' + p + '"]');
+    if (input && input.value.trim()) params[p] = input.value.trim();
+  }
+  return params;
 }
 
-function saveHistory(username) {
-  const key = "rpdm_history";
-  const cur = JSON.parse(localStorage.getItem(key) || "[]");
-  const next = [username, ...cur.filter(u => u !== username)].slice(0, 20);
-  localStorage.setItem(key, JSON.stringify(next));
+function buildQuery() {
+  const params = new URLSearchParams({ ds: currentStore.id });
+  const extras = getExtraParams();
+  for (const [k, v] of Object.entries(extras)) params.set(k, v);
+  return params.toString();
+}
+
+// ---- Tabs ----
+function renderGameTabs() {
+  const container = $("gameTabs");
+  container.innerHTML = "";
+  config.games.forEach((game, i) => {
+    const tab = document.createElement("div");
+    tab.className = "game-tab" + (i === currentGameIdx ? " active" : "");
+    tab.textContent = game.name;
+    tab.onclick = () => selectGame(i);
+    container.appendChild(tab);
+  });
+}
+
+function renderStoreTabs() {
+  const container = $("storeTabs");
+  container.innerHTML = "";
+  if (!config.games.length) return;
+
+  const game = config.games[currentGameIdx];
+  game.stores.forEach((store, i) => {
+    const tab = document.createElement("div");
+    tab.className = "store-tab" + (i === currentStoreIdx ? " active" : "");
+    tab.innerHTML = store.storeLabel + '<span class="store-key">' + store.keyTemplate + '</span>';
+    tab.onclick = () => selectStore(i);
+    container.appendChild(tab);
+  });
+}
+
+function selectGame(idx) {
+  currentGameIdx = idx;
+  currentStoreIdx = 0;
+  renderGameTabs();
+  renderStoreTabs();
+  applyStoreSelection();
+  localStorage.setItem("rpdm_gameIdx", idx);
+}
+
+function selectStore(idx) {
+  currentStoreIdx = idx;
+  renderStoreTabs();
+  applyStoreSelection();
+  localStorage.setItem("rpdm_storeIdx_" + currentGameIdx, idx);
+}
+
+function applyStoreSelection() {
+  if (!config.games.length) return;
+  const game = config.games[currentGameIdx];
+  currentStore = game.stores[currentStoreIdx] || game.stores[0];
+
+  // Render extra param inputs
+  const container = $("extraParams");
+  container.innerHTML = "";
+  for (const p of currentStore.extraParams) {
+    const input = document.createElement("input");
+    input.placeholder = p.charAt(0).toUpperCase() + p.slice(1);
+    input.dataset.param = p;
+    const saved = localStorage.getItem("rpdm_param_" + p);
+    if (saved) input.value = saved;
+    input.addEventListener("input", () => localStorage.setItem("rpdm_param_" + p, input.value));
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") fetchPlayer(); });
+    container.appendChild(input);
+  }
+
+  renderHistory();
+
+  // Clear loaded data
+  lastJson = null;
+  lastEtag = null;
+  lastEntryId = null;
+  $("title").textContent = "No player loaded";
+  $("subtitle").textContent = "";
+  $("output").textContent = "Fetch a player to view their data.";
+  $("editor").value = "";
+  setMainStatus("No data loaded.");
+}
+
+// ---- History ----
+function historyKey() {
+  return "rpdm_history_" + (currentStore?.id || "default");
+}
+
+function saveHistory(username, extras) {
+  const label = extras && Object.keys(extras).length
+    ? username + " [" + Object.entries(extras).map(([k,v]) => k + "=" + v).join(", ") + "]"
+    : username;
+
+  const cur = JSON.parse(localStorage.getItem(historyKey()) || "[]");
+  const entry = { label, username, extras: extras || {} };
+  const next = [entry, ...cur.filter(e => e.label !== label)].slice(0, 20);
+  localStorage.setItem(historyKey(), JSON.stringify(next));
   renderHistory();
 }
 
 function renderHistory() {
-  const key = "rpdm_history";
-  const list = JSON.parse(localStorage.getItem(key) || "[]");
+  const list = JSON.parse(localStorage.getItem(historyKey()) || "[]");
   const root = $("history");
   root.innerHTML = "";
   if (!list.length) {
     root.innerHTML = '<div class="tiny">No recent lookups.</div>';
     return;
   }
-  for (const u of list) {
+  for (const entry of list) {
+    const label = typeof entry === "string" ? entry : entry.label;
+    const username = typeof entry === "string" ? entry : entry.username;
+    const extras = typeof entry === "string" ? {} : (entry.extras || {});
+
     const div = document.createElement("div");
     div.className = "historyItem";
-    div.innerHTML = '<span>' + u + '</span><span class="tiny">Load</span>';
-    div.onclick = () => { $("username").value = u; fetchPlayer(); };
+    div.innerHTML = '<span>' + label + '</span><span class="tiny">Load</span>';
+    div.onclick = () => {
+      $("username").value = username;
+      for (const [k, v] of Object.entries(extras)) {
+        const input = document.querySelector('[data-param="' + k + '"]');
+        if (input) input.value = v;
+      }
+      fetchPlayer();
+    };
     root.appendChild(div);
   }
 }
 
-function renderCards(json) {
-  const v = json?.data?.value;
-  const d = v?.Data;
-  const md = v?.MetaData;
+// ---- Display ----
+function displayData(json) {
+  const data = json.data;
 
-  const cards = [
-    ["Username", json.username],
-    ["UserId", json.userId],
-    ["ProfileCreateTime", unixToLocal(md?.ProfileCreateTime)],
-    ["LastUpdate", unixToLocal(md?.LastUpdate)],
-  ];
+  $("title").textContent = json.username + " (" + json.userId + ")";
+  $("subtitle").textContent =
+    json.game + " > " + json.store +
+    " | Entry: " + json.entryId +
+    " | ETag: " + (data?.etag || "-");
 
-  $("cards").innerHTML = cards.map(([label, value]) => \`
-    <div class="card">
-      <div class="label">\${label}</div>
-      <div class="value">\${(value ?? "—")}</div>
-    </div>
-  \`).join("");
+  $("output").innerHTML = syntaxHighlight(data?.value ?? null);
+  $("editor").value = JSON.stringify(data?.value ?? null, null, 2);
+  $("editor").readOnly = false;
 }
 
-function toRows(obj) {
-  if (!obj || typeof obj !== "object") return [];
-  return Object.keys(obj).sort().map(k => [k, obj[k]]);
-}
-
-function renderTable(title, obj) {
-  const rows = toRows(obj);
-  if (!rows.length) return '<div class="tiny">No data</div>';
-
-  return \`
-    <div class="tiny">\${title}</div>
-    <table>
-      <thead><tr><th>Key</th><th>Value</th></tr></thead>
-      <tbody>
-        \${rows.map(([k,v]) => {
-          // Handle nested objects/arrays by showing JSON
-          const display = (typeof v === "object" && v !== null) 
-            ? '<code>' + JSON.stringify(v) + '</code>' 
-            : v;
-          return \`<tr><td>\${k}</td><td>\${display}</td></tr>\`;
-        }).join("")}
-      </tbody>
-    </table>
-  \`;
-}
-
-function setPowerModeEditable(editable, hint) {
-  const ta = $("powerJson");
-  ta.readOnly = !editable;
-  ta.style.opacity = editable ? "1" : "0.65";
-  $("editHint").textContent = hint || "";
-}
-
-function setPowerModeJson(obj) {
-  $("powerJson").value = JSON.stringify(obj ?? null, null, 2);
-}
-
-function activateTab(i) {
-  if (!lastJson || !allTabs.length) return;
-
-  currentTabIndex = i;
-  currentTab = allTabs[i];
-
-  // UI active state
-  const root = $("tabs");
-  [...root.querySelectorAll(".tab")].forEach((el, idx) => {
-    el.classList.toggle("active", idx === i);
-  });
-
-  // Update Section View / Output
-  if (currentTab.kind === "table") {
-    $("sectionView").innerHTML = renderTable(currentTab.title, currentTab.payload);
-    $("output").innerHTML = syntaxHighlight({ section: currentTab.name, value: currentTab.payload ?? null });
-  } else {
-    $("sectionView").innerHTML = '<div class="tiny">Showing JSON in output pane.</div>';
-    $("output").innerHTML = syntaxHighlight(currentTab.payload ?? null);
-  }
-
-  // Power Mode follows tab (worldwide filter)
-  setPowerModeJson(currentTab.payload);
-
-  // editable only if it maps to value.Data subtree (safe)
-  if (currentTab.editPath) {
-    setPowerModeEditable(true, "Editing path: value." + currentTab.editPath.join("."));
-  } else {
-    setPowerModeEditable(false, "Read-only for this tab.");
-  }
-
-  setMainStatus("Viewing: " + currentTab.name + (currentTab.editPath ? "" : " (read-only)"), "good");
-}
-
-// ---------- Dynamic Tab Builder ----------
-function isTabableObject(val) {
-  // An object is "tabable" if it's a plain object (not array)
-  if (val === null || typeof val !== "object" || Array.isArray(val)) return false;
-  return true;
-}
-
-function isPrimitiveObject(val) {
-  // Returns true if object only contains primitive values (good for table display)
-  if (!isTabableObject(val)) return false;
-  return Object.values(val).every(v => 
-    v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean"
-  );
-}
-
-function buildTabs(value, data) {
-  const tabs = [];
-  
-  // Group 1: Core views
-  tabs.push(
-    { name: "Full", kind: "json", payload: lastJson, editPath: null, group: "core" },
-    { name: "Data", kind: "json", payload: data, editPath: ["Data"], group: "core" }
-  );
-
-  // Group 2: Stats sub-objects (auto-detected)
-  const stats = data?.Stats;
-  if (stats && typeof stats === "object") {
-    const statsKeys = Object.keys(stats).sort();
-    for (const key of statsKeys) {
-      const val = stats[key];
-      if (isTabableObject(val)) {
-        tabs.push({
-          name: key,
-          kind: isPrimitiveObject(val) ? "table" : "json",
-          payload: val,
-          title: "Stats." + key,
-          editPath: ["Data", "Stats", key],
-          group: "stats"
-        });
-      }
-    }
-  }
-
-  // Group 3: Other Data sub-objects (Equipment, Eggs, Inventory, etc.)
-  if (data && typeof data === "object") {
-    const dataKeys = Object.keys(data).sort();
-    for (const key of dataKeys) {
-      if (key === "Stats") continue; // Already handled
-      const val = data[key];
-      if (isTabableObject(val)) {
-        tabs.push({
-          name: key,
-          kind: isPrimitiveObject(val) ? "table" : "json",
-          payload: val,
-          title: "Data." + key,
-          editPath: ["Data", key],
-          group: "data"
-        });
-      }
-    }
-  }
-
-  // Group 4: Metadata (read-only)
-  tabs.push(
-    { name: "MetaData", kind: "json", payload: value?.MetaData, editPath: null, group: "meta" },
-    { name: "GlobalUpdates", kind: "json", payload: value?.GlobalUpdates, editPath: null, group: "meta" }
-  );
-
-  return tabs;
-}
-
-function renderTabs() {
-  if (!lastJson) return;
-
-  const entry = lastJson.data;
-  const value = entry?.value;
-  const data = value?.Data;
-
-  allTabs = buildTabs(value, data);
-
-  const root = $("tabs");
-  root.style.display = "block";
-  
-  // Group tabs by category
-  const groups = {
-    core: { label: "Core", tabs: [] },
-    stats: { label: "Stats", tabs: [] },
-    data: { label: "Data Objects", tabs: [] },
-    meta: { label: "Metadata (Read-only)", tabs: [] }
-  };
-
-  allTabs.forEach((t, i) => {
-    const group = t.group || "data";
-    if (groups[group]) {
-      groups[group].tabs.push({ ...t, index: i });
-    }
-  });
-
-  let html = '';
-  for (const [groupKey, group] of Object.entries(groups)) {
-    if (group.tabs.length === 0) continue;
-    html += '<div class="tab-group">';
-    html += '<div class="tab-group-label">' + group.label + '</div>';
-    for (const t of group.tabs) {
-      const readonlyClass = t.editPath ? '' : ' readonly';
-      html += '<div class="tab' + readonlyClass + '" data-i="' + t.index + '">' + t.name + '</div>';
-    }
-    html += '</div>';
-  }
-  
-  root.innerHTML = html;
-
-  root.onclick = (e) => {
-    const el = e.target.closest(".tab");
-    if (!el) return;
-    activateTab(Number(el.dataset.i));
-  };
-
-  // Default to Data tab
-  activateTab(1);
-}
-
-function fillPowerModeFromCurrentTab() {
-  if (!lastJson || !currentTab) return;
-  setPowerModeJson(currentTab.payload);
-  setMainStatus("Reset to loaded data for " + currentTab.name, "good");
-}
-
-// ---------- Networking ----------
+// ---- Fetch ----
 async function fetchPlayer() {
   const username = $("username").value.trim();
   if (!username) return;
+  if (!currentStore) return setSideStatus("Select a datastore first.", "bad");
 
-  setSideStatus("Loading…");
-  setMainStatus("Loading…");
-  $("output").textContent = "Loading…";
+  const extras = getExtraParams();
+  for (const p of (currentStore.extraParams || [])) {
+    if (!extras[p]) return setSideStatus("Missing: " + p, "bad");
+  }
+
+  setSideStatus("Loading...");
+  setMainStatus("Loading...");
+  $("output").textContent = "Loading...";
 
   try {
-    const r = await fetch("/api/player/" + encodeURIComponent(username));
+    const r = await fetch("/api/player/" + encodeURIComponent(username) + "?" + buildQuery());
     const json = await r.json();
     if (!r.ok) throw new Error(json?.error || "Request failed");
 
@@ -697,19 +1004,11 @@ async function fetchPlayer() {
     lastEtag = json.data?.etag || null;
     lastEntryId = json.entryId;
 
-    $("title").textContent = json.username + " (UserId " + json.userId + ")";
-    $("subtitle").textContent =
-      "Entry: " + json.entryId +
-      " • ETag: " + (lastEtag || "—") +
-      " • Revision: " + (json.data?.revisionId || "—");
-
-    renderCards(json);
-    renderTabs();
-
-    setSideStatus("Loaded ✅", "good");
-    setMainStatus("Loaded. Select a tab, edit Power Mode JSON, Save.", "good");
-
-    saveHistory(username);
+    displayData(json);
+    setSideStatus("Loaded", "good");
+    setMainStatus("Edit the JSON on the right and hit Save.", "good");
+    saveHistory(username, extras);
+    localStorage.setItem("rpdm_lastUsername", username);
   } catch (e) {
     setSideStatus("Error: " + (e.message || "unknown"), "bad");
     setMainStatus("Error: " + (e.message || "unknown"), "bad");
@@ -717,162 +1016,185 @@ async function fetchPlayer() {
   }
 }
 
+// ---- Save ----
 async function saveEdits() {
-  if (!lastJson || !currentTab) {
-    return setMainStatus("Load a player first.", "bad");
-  }
-  if (!currentTab.editPath) {
-    return setMainStatus("This tab is read-only.", "bad");
-  }
+  if (!lastJson) return setMainStatus("Load a player first.", "bad");
 
-  let newObj;
+  let newValue;
   try {
-    newObj = JSON.parse($("powerJson").value || "null");
+    newValue = JSON.parse($("editor").value || "null");
   } catch {
-    return setMainStatus("Power mode JSON is invalid JSON.", "bad");
+    return setMainStatus("Invalid JSON in editor.", "bad");
   }
 
-  // basic sanity: for the table-ish tabs, encourage object shape
-  if (currentTab.kind === "table" && !(newObj === null || typeof newObj === "object")) {
-    return setMainStatus("Expected an object for this section.", "bad");
-  }
-
-  setMainStatus("Saving…");
+  setMainStatus("Saving...");
 
   try {
-    const r = await fetch("/api/player/" + encodeURIComponent(lastUsername) + "/set-section", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        expectedEtag: lastEtag,
-        editPath: currentTab.editPath,
-        value: newObj
-      }),
-    });
+    const r = await fetch(
+      "/api/player/" + encodeURIComponent(lastUsername) + "/update?" + buildQuery(),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedEtag: lastEtag, value: newValue }),
+      }
+    );
 
     const json = await r.json();
     if (!r.ok) throw new Error(json?.error || "Save failed");
 
-    setMainStatus("Saved ✅ Reloading…", "good");
+    setMainStatus("Saved. Reloading...", "good");
     await fetchPlayer();
   } catch (e) {
     setMainStatus("Save failed: " + (e.message || "unknown"), "bad");
   }
 }
 
-// Buttons
+// ---- Purge ----
+function openPurgeDialog() {
+  const username = $("username").value.trim();
+  if (!username) return setSideStatus("Enter a username first.", "bad");
+  if (!config.games.length) return;
+
+  const game = config.games[currentGameIdx];
+  const storeList = game.stores.map(s => s.storeLabel).join(", ");
+
+  $("purgeDesc").textContent =
+    'Delete ALL data for "' + username + '" from ' + game.name +
+    " (" + storeList + ").";
+
+  $("purgeLog").innerHTML = "";
+  $("purgeLog").className = "purge-log";
+  $("btnConfirmPurge").disabled = false;
+  $("btnConfirmPurge").textContent = "Confirm Purge";
+  $("btnConfirmPurge").onclick = executePurge;
+  $("purgeOverlay").className = "overlay show";
+}
+
+function closePurgeDialog() {
+  $("purgeOverlay").className = "overlay";
+}
+
+async function executePurge() {
+  const username = $("username").value.trim();
+  if (!username) return;
+
+  const game = config.games[currentGameIdx];
+  const log = $("purgeLog");
+  log.innerHTML = "";
+  log.className = "purge-log show";
+
+  $("btnConfirmPurge").disabled = true;
+  $("btnConfirmPurge").textContent = "Purging...";
+
+  function addLog(cls, msg) {
+    log.innerHTML += '<div class="' + cls + '">' + msg + '</div>';
+    log.scrollTop = log.scrollHeight;
+  }
+
+  addLog("ok", "Starting purge for " + username + " on " + game.name + "...");
+
+  try {
+    const r = await fetch(
+      "/api/purge/" + encodeURIComponent(username) + "?game=" + encodeURIComponent(game.num),
+      { method: "POST", headers: { "Content-Type": "application/json" } }
+    );
+    const json = await r.json();
+
+    if (!r.ok) {
+      addLog("fail", "Error: " + (json.error || "Request failed"));
+      $("btnConfirmPurge").textContent = "Failed";
+      return;
+    }
+
+    // Log each result
+    for (const res of json.results) {
+      if (!res.ok) {
+        addLog("fail", "FAILED " + res.store + " / " + res.entryId + " — " + (res.error || "unknown"));
+      } else if (res.skipped) {
+        addLog("skip", "SKIP " + res.store + " / " + res.entryId + " (not found)");
+      } else {
+        addLog("del", "DELETED " + res.store + " / " + res.entryId);
+      }
+    }
+
+    const s = json.summary;
+    addLog("ok", "Done. Deleted: " + s.deleted + ", Skipped: " + s.skipped + ", Failed: " + s.failed);
+
+    $("btnConfirmPurge").disabled = false;
+    $("btnConfirmPurge").textContent = s.failed > 0 ? "Completed with errors" : "Done";
+    $("btnConfirmPurge").onclick = closePurgeDialog;
+
+    // Clear loaded data since it's gone
+    if (s.failed === 0) {
+      lastJson = null;
+      lastEtag = null;
+      lastEntryId = null;
+      $("title").textContent = "No player loaded";
+      $("subtitle").textContent = "";
+      $("output").textContent = "Player data purged.";
+      $("editor").value = "";
+      setMainStatus("Player data purged.", "good");
+      setSideStatus("Purge complete", "good");
+    }
+  } catch (e) {
+    addLog("fail", "Network error: " + (e.message || "unknown"));
+    $("btnConfirmPurge").textContent = "Failed";
+  }
+}
+
+$("btnPurge").onclick = openPurgeDialog;
+$("btnCancelPurge").onclick = closePurgeDialog;
+$("btnConfirmPurge").onclick = executePurge;
+$("purgeOverlay").onclick = (e) => { if (e.target === $("purgeOverlay")) closePurgeDialog(); };
+
+// ---- Buttons ----
 $("btnFetch").onclick = fetchPlayer;
-$("btnReload").onclick = () => fetchPlayer();
+$("btnReload").onclick = fetchPlayer;
 $("btnCopy").onclick = () => {
   if (!lastJson) return;
-  navigator.clipboard.writeText(JSON.stringify(lastJson, null, 2));
-  setMainStatus("Copied full JSON ✅", "good");
+  navigator.clipboard.writeText(JSON.stringify(lastJson.data?.value ?? null, null, 2));
+  setSideStatus("Copied JSON", "good");
 };
 $("btnSave").onclick = saveEdits;
-$("btnReset").onclick = fillPowerModeFromCurrentTab;
+$("btnReset").onclick = () => {
+  if (!lastJson) return;
+  $("editor").value = JSON.stringify(lastJson.data?.value ?? null, null, 2);
+  setMainStatus("Reset to last loaded data.", "good");
+};
 
 $("username").addEventListener("keydown", (e) => { if (e.key === "Enter") fetchPlayer(); });
 
-window.addEventListener("DOMContentLoaded", () => {
-  renderHistory();
-  const last = localStorage.getItem("rpdm_lastUsername");
-  if (last) $("username").value = last;
+// ---- Init ----
+window.addEventListener("DOMContentLoaded", async () => {
+  try {
+    const r = await fetch("/api/config");
+    config = await r.json();
+  } catch {
+    setSideStatus("Failed to load config", "bad");
+    return;
+  }
 
-  // persist last username on fetch
-  const originalFetch = fetchPlayer;
-  fetchPlayer = async function() {
-    const u = $("username").value.trim();
-    if (u) localStorage.setItem("rpdm_lastUsername", u);
-    return originalFetch();
-  };
+  const savedGame = parseInt(localStorage.getItem("rpdm_gameIdx") || "0");
+  currentGameIdx = savedGame < config.games.length ? savedGame : 0;
+  const savedStore = parseInt(localStorage.getItem("rpdm_storeIdx_" + currentGameIdx) || "0");
+  currentStoreIdx = savedStore < (config.games[currentGameIdx]?.stores.length || 0) ? savedStore : 0;
+
+  renderGameTabs();
+  renderStoreTabs();
+  applyStoreSelection();
+
+  const lastUser = localStorage.getItem("rpdm_lastUsername");
+  if (lastUser) $("username").value = lastUser;
 });
 </script>
 </body>
 </html>`);
 });
 
-// ---------- API: Read Player ----------
-app.get("/api/player/:username", async (req, res) => {
-  try {
-    const username = req.params.username;
-
-    const userId = await usernameToUserId(username);
-    if (!userId) return res.status(404).json({ error: "Username not found" });
-
-    const entryId = `Player_${userId}`;
-    const data = await fetchJson(entryUrl(entryId), {
-      headers: { "x-api-key": ROBLOX_API_KEY },
-    });
-
-    res.json({ username, userId, entryId, data });
-  } catch (err) {
-    res.status(err.status || 500).json({ error: err.message, details: err.details || null });
-  }
-});
-
-// ---------- API: Update a specific section under entry.value (ETag protected) ----------
-app.post("/api/player/:username/set-section", requireAdmin, async (req, res) => {
-  try {
-    const username = req.params.username;
-    const { expectedEtag, editPath, value } = req.body || {};
-
-    if (!Array.isArray(editPath) || editPath.length === 0) {
-      return res.status(400).json({ error: "Body must include { editPath: [..], value: ... }" });
-    }
-
-    // Safety: only allow edits within Data subtree (value.Data...)
-    if (editPath[0] !== "Data") {
-      return res.status(400).json({ error: "Edits are only allowed within value.Data.*" });
-    }
-
-    const userId = await usernameToUserId(username);
-    if (!userId) return res.status(404).json({ error: "Username not found" });
-
-    const entryId = `Player_${userId}`;
-
-    // 1) Read latest
-    const current = await fetchJson(entryUrl(entryId), {
-      headers: { "x-api-key": ROBLOX_API_KEY },
-    });
-
-    const currentEtag = current.etag;
-    if (expectedEtag && currentEtag && expectedEtag !== currentEtag) {
-      return res.status(409).json({
-        error: "ETag mismatch (someone updated this entry). Reload and try again.",
-        expectedEtag,
-        currentEtag,
-      });
-    }
-
-    // 2) Apply patch
-    const newValue = isPlainObject(current.value) ? { ...current.value } : {};
-    if (!isPlainObject(newValue.Data)) newValue.Data = {};
-
-    setAtPath(newValue, editPath, value);
-
-    const body = JSON.stringify({ value: newValue });
-
-    // 3) Write back with If-Match
-    const updated = await fetchJson(entryUrl(entryId), {
-      method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body).toString(),
-        "x-api-key": ROBLOX_API_KEY,
-        ...(currentEtag ? { "If-Match": currentEtag } : {}),
-      },
-      body,
-    });
-
-    res.json({ ok: true, entryId, updated });
-  } catch (err) {
-    res.status(err.status || 500).json({ error: err.message, details: err.details || null });
-  }
-});
-
 // ---------- Start ----------
 app.listen(PORT, () => {
-  console.log("✅ Roblox Player Data Manager running");
-  console.log(`🌐 http://localhost:${PORT}`);
-  console.log(`❤️  http://localhost:${PORT}/health`);
+  console.log("Roblox Player Data Manager running on http://localhost:" + PORT);
+  for (const g of GAMES) {
+    console.log("  " + g.name + " (" + g.universeId + "): " + g.stores.map((s) => s.storeLabel).join(", "));
+  }
 });
